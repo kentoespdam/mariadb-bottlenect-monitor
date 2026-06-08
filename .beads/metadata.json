@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "mariadb_bottlenect_monitor",
+  "project_id": "254402be-9790-42bb-b246-2084cfb8ca88"
+}
