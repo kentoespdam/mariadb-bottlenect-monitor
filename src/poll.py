@@ -41,13 +41,27 @@ def phase_one(db: DatabaseConnection) -> int | None:
 def _parse_lock_waits_from_status(status_text: str) -> dict[str, Any] | None:
     """Parse SHOW ENGINE INNODB STATUS for lock wait information.
 
-    Looks for '--- LOCK WAIT ---' sections, extracts the WAITING thread info
-    and identifies the blocker via trx_id references.
+    MariaDB 11.x: INNODB_LOCK_WAITS is often empty. Fallback to parsing
+    SHOW ENGINE INNODB STATUS. Lock waits appear in LATEST DETECTED DEADLOCK
+    or in the TRANSACTIONS section as 'LOCK WAIT' inline keyword.
+
+    Each LOCK WAIT block format:
+        TRANSACTION 123, ACTIVE 1 sec ...
+        LOCK WAIT 5 lock struct(s)...
+        MariaDB thread id 10426, OS thread handle ..., query id ... host user Updating
+        UPDATE sbtest1 SET ... WHERE id=...
+        *** WAITING FOR THIS LOCK TO BE GRANTED: ...
+        *** CONFLICTING WITH:
+        RECORD LOCKS ... trx id 456 ...
+
+    The BLOCKER is identified by the CONFLICTING trx_id. We return the
+    BLOCKER's thread_id (the one to KILL), not the waiter.
     """
-    # Find all LOCK WAIT sections
+    # Find all LOCK WAIT blocks (anywhere in status text)
     lock_wait_pattern = re.compile(
-        r'---\s*LOCK\s*WAIT\s*---\s*\n'
-        r'(.*?)(?=---\s*LOCK\s*WAIT\s*---|---\s*TRANSACTIONS\s*---|\Z)',
+        r'(?:^|\n)LOCK WAIT \d+ lock struct.*?\n'
+        r'MariaDB thread id (\d+),.*?query id \d+\s+(\S+)\s+(\S+)\s+\S+\n'
+        r'(.+?)(?=\n\*\*\* WAITING|\nTRANSACTION |\n---|\Z)',
         re.DOTALL
     )
 
@@ -55,29 +69,60 @@ def _parse_lock_waits_from_status(status_text: str) -> dict[str, Any] | None:
     if not matches:
         return None
 
-    # Parse the first lock wait section
-    section = matches[0].group(1)
+    # Find the BLOCKER: look for CONFLICTING WITH sections
+    conflicting_pattern = re.compile(
+        r'\*\*\* CONFLICTING WITH:\s*\n'
+        r'RECORD LOCKS.*?trx id (\d+)',
+        re.DOTALL
+    )
+    conflicts = list(conflicting_pattern.finditer(status_text))
 
-    # Extract waiting thread info
-    thread_match = re.search(r'MariaDB thread id (\d+)', section)
-    query_match = re.search(r'query id \d+\s+\S+\s+(\S+)\s+(\S+)', section)
+    # Extract waiter info from first match
+    # Format: "query id <num> <host> <user> <state>"
+    first = matches[0]
+    waiter_thread = int(first.group(1))
+    waiter_host = first.group(2)
+    waiter_user = first.group(3)
+    waiter_query = first.group(4).strip()
 
-    if not thread_match:
-        return None
+    # Try to find the blocker by CONFLICTING trx_id
+    blocker_thread = None
+    blocker_user = waiter_user  # fallback
+    blocker_host = waiter_host
+    if conflicts:
+        blocker_trx_id = int(conflicts[0].group(1))
+        # Find this trx_id in the full status to get thread info
+        trx_pattern = re.compile(
+            rf'TRANSACTION {blocker_trx_id},.*?\n'
+            r'(?:.*?\n)*?'
+            r'MariaDB thread id (\d+),.*?query id \d+\s+(\S+)\s+(\S+)\s+\S+\n'
+            r'(.+?)(?=\n\*\*\*|\nTRANSACTION |\Z)',
+            re.DOTALL
+        )
+        trx_match = trx_pattern.search(status_text)
+        if trx_match:
+            blocker_thread = int(trx_match.group(1))
+            blocker_host = trx_match.group(2)
+            blocker_user = trx_match.group(3)
 
-    thread_id = int(thread_match.group(1))
-    user = query_match.group(1) if query_match else "unknown"
-    host = query_match.group(2) if query_match else "unknown"
-
-    # Count total lock waits
     waiter_count = len(matches)
 
+    # Return blocker info (the one to kill), falling back to waiter info
+    target_thread = blocker_thread or waiter_thread
+    target_user = blocker_user
+    target_host = blocker_host
+
+    log.info(
+        "INNODB STATUS: %d lock wait(s), waiter thread=%d, blocker thread=%s",
+        waiter_count, waiter_thread, blocker_thread,
+    )
+
     return {
-        "thread_id": thread_id,
-        "user": user,
-        "host": host,
-        "trx_started": "",  # Not available from INNODB STATUS
-        "query_text": "",  # Not available from INNODB STATUS
+        "thread_id": target_thread,
+        "user": target_user,
+        "host": target_host,
+        "trx_started": "",
+        "query_text": waiter_query,
         "waiter_count": waiter_count,
     }
 
