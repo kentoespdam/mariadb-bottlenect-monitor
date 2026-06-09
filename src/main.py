@@ -29,6 +29,15 @@ def _setup_logging(verbose: bool) -> None:
     )
 
 
+def _send_telegram(telegram: TelegramAlert, alert_type: str, data: dict) -> None:
+    """Send Telegram alert synchronously (best-effort, never blocks poll loop on error)."""
+    try:
+        import asyncio
+        asyncio.run(telegram.send(alert_type, data))
+    except Exception:
+        log.debug("Telegram send skipped", exc_info=True)
+
+
 def _on_result(
     result: PollResult,
     n_counter: NCounter,
@@ -38,6 +47,8 @@ def _on_result(
     db: DatabaseConnection,
     durable: DurableLog,
     blocker_state: dict,
+    telegram: TelegramAlert,
+    prev_bottleneck: list[bool],
 ) -> None:
     """Log poll cycle state and trigger auto-heal when conditions are met."""
     if result.phase_one_ok:
@@ -49,6 +60,22 @@ def _on_result(
             k_counter.value,
             "YES" if bottleneck.is_set else "no",
         )
+
+        # --- Telegram: bottleneck edge detection ---
+        if bottleneck.is_set and not prev_bottleneck[0]:
+            log.info("Bottleneck DETECTED — sending Telegram alert")
+            _send_telegram(telegram, "bottleneck_detected", {
+                "threads_running": result.threads_running,
+                "blocker": result.blocker,
+                "action": "Bottleneck terdeteksi — threads_running melebihi threshold",
+            })
+        elif not bottleneck.is_set and prev_bottleneck[0]:
+            log.info("Bottleneck RESOLVED — sending Telegram alert")
+            _send_telegram(telegram, "bottleneck_resolved", {
+                "threads_running": result.threads_running,
+                "action": "Bottleneck resolved — threads_running kembali normal",
+            })
+        prev_bottleneck[0] = bottleneck.is_set
 
         # Auto-heal: track blocker age and kill when threshold reached
         if cfg.auto_heal and result.blocker is not None:
@@ -70,8 +97,23 @@ def _on_result(
                     "user": identity.get("user"),
                     "host": identity.get("host"),
                 })
+                # --- Telegram: auto_heal result ---
                 if success:
+                    _send_telegram(telegram, "auto_heal_killed", {
+                        "thread_id": blocker_id,
+                        "user": identity.get("user"),
+                        "host": identity.get("host"),
+                        "action": f"KILL QUERY {blocker_id} — {msg}",
+                    })
                     del blocker_state[blocker_id]
+                else:
+                    _send_telegram(telegram, "auto_heal_failed", {
+                        "thread_id": blocker_id,
+                        "user": identity.get("user"),
+                        "host": identity.get("host"),
+                        "error": msg,
+                        "action": f"Gagal kill thread {blocker_id}",
+                    })
         elif result.blocker is None:
             # Clear stale blocker tracking when no blocker detected
             stale_ids = [bid for bid, s in blocker_state.items() if s["seen"] > cfg.M + 3]
@@ -123,10 +165,13 @@ def main() -> None:
     log.info("Capability check: SUPER privilege=%s", has_super)
 
     telegram = TelegramAlert(cfg)
+    telegram_enabled = bool(cfg.telegram_bot_token and cfg.telegram_chat_id)
+    log.info("Telegram alerts: %s (chat_id=%s)", "enabled" if telegram_enabled else "disabled", cfg.telegram_chat_id)
 
     n_counter = NCounter(cfg.N)
     k_counter = KCounter(cfg.K)
     bottleneck_state = StateToggle("bottleneck")
+    prev_bottleneck: list[bool] = [False]
     log.info("State machine ready: N_threshold=%d, K_threshold=%d", cfg.N, cfg.K)
 
     signal.signal(signal.SIGTERM, _handle_signal)
@@ -151,7 +196,8 @@ def main() -> None:
             bottleneck_state,
             durable,
             lambda r: _on_result(
-                r, n_counter, k_counter, bottleneck_state, cfg, db, durable, blocker_state
+                r, n_counter, k_counter, bottleneck_state, cfg, db, durable,
+                blocker_state, telegram, prev_bottleneck,
             ),
         )
     except KeyboardInterrupt:
