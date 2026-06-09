@@ -56,14 +56,16 @@ class TestTelegramAlert:
     def test_format_message_bottleneck(self) -> None:
         alert = TelegramAlert(_make_cfg())
         msg = alert._format_message(
-            "bottleneck", {"threads_running": 50, "blocker": {"user": "u1", "host": "h1", "thread_id": 123}}
+            "bottleneck_detected", {"threads_running": 50, "blocker": {"user": "u1", "host": "h1", "thread_id": 123, "query_text": "SELECT 1"}}
         )
-        assert "bottleneck" in msg
-        assert "Threads" in msg
+        assert "BOTTLENECK DETECTED" in msg
+        assert "50" in msg
         assert "u1@h1" in msg
+        assert "123" in msg
 
     def test_format_message_heal(self) -> None:
         alert = TelegramAlert(_make_cfg())
-        msg = alert._format_message("heal", {"action": "kill", "threads_running": 10})
-        assert "heal" in msg
-        assert "kill" in msg
+        msg = alert._format_message("auto_heal_killed", {"action": "kill sent", "thread_id": 456, "user": "dev", "host": "h1"})
+        assert "AUTO HEAL KILLED" in msg
+        assert "kill sent" in msg
+        assert "dev@h1" in msg
