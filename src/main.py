@@ -15,6 +15,7 @@ from .poll import PollResult
 from .scheduler import schedule_polls
 from .state import StateToggle
 from .telegram_alert import TelegramAlert
+from .auto_heal import kill_blocker, resolve_blocker_identity
 
 log = logging.getLogger(__name__)
 
@@ -28,8 +29,17 @@ def _setup_logging(verbose: bool) -> None:
     )
 
 
-def _on_result(result: PollResult, n_counter: NCounter, k_counter: KCounter, bottleneck: StateToggle) -> None:
-    """Log poll cycle state after each run."""
+def _on_result(
+    result: PollResult,
+    n_counter: NCounter,
+    k_counter: KCounter,
+    bottleneck: StateToggle,
+    cfg: Config,
+    db: DatabaseConnection,
+    durable: DurableLog,
+    blocker_state: dict,
+) -> None:
+    """Log poll cycle state and trigger auto-heal when conditions are met."""
     if result.phase_one_ok:
         log.debug(
             "poll ok  tr=%s  N=%d/%s  K=%d  bottleneck=%s",
@@ -39,6 +49,34 @@ def _on_result(result: PollResult, n_counter: NCounter, k_counter: KCounter, bot
             k_counter.value,
             "YES" if bottleneck.is_set else "no",
         )
+
+        # Auto-heal: track blocker age and kill when threshold reached
+        if cfg.auto_heal and result.blocker is not None:
+            blocker_id = result.blocker["thread_id"]
+            if blocker_id not in blocker_state:
+                blocker_state[blocker_id] = {"seen": 0, "identity": result.blocker}
+            blocker_state[blocker_id]["seen"] += 1
+
+            if blocker_state[blocker_id]["seen"] >= cfg.M:
+                identity = blocker_state[blocker_id]["identity"]
+                poll_state = {"n_elapsed": blocker_state[blocker_id]["seen"], "age_threshold": cfg.M}
+                success, msg = kill_blocker(db, identity, result.blocker, cfg, poll_state)
+                log.info("Auto-heal thread %d: success=%s msg=%s", blocker_id, success, msg)
+                durable.append({
+                    "event": "auto_heal",
+                    "thread_id": blocker_id,
+                    "success": success,
+                    "outcome": msg,
+                    "user": identity.get("user"),
+                    "host": identity.get("host"),
+                })
+                if success:
+                    del blocker_state[blocker_id]
+        elif result.blocker is None:
+            # Clear stale blocker tracking when no blocker detected
+            stale_ids = [bid for bid, s in blocker_state.items() if s["seen"] > cfg.M + 3]
+            for bid in stale_ids:
+                del blocker_state[bid]
     else:
         log.warning(
             "poll blind  K=%d/%s  N=%s",
@@ -102,6 +140,8 @@ def main() -> None:
     }
     asyncio.run(telegram.send("started", data))
 
+    blocker_state: dict = {}
+
     try:
         schedule_polls(
             cfg,
@@ -110,7 +150,9 @@ def main() -> None:
             k_counter,
             bottleneck_state,
             durable,
-            lambda r: _on_result(r, n_counter, k_counter, bottleneck_state),
+            lambda r: _on_result(
+                r, n_counter, k_counter, bottleneck_state, cfg, db, durable, blocker_state
+            ),
         )
     except KeyboardInterrupt:
         log.info("Shutdown requested")
