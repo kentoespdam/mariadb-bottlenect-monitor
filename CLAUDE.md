@@ -1,3 +1,22 @@
+## Truth Sources
+
+This project maintains **three canonical sources of truth** — every design and implementation decision must be consistent with all three:
+
+1. **`draft-prd.md`** — Product Requirements Document. High-level product goals, tech stack, architecture, and feature specs.
+2. **`CONTEXT.md`** — Domain glossary. Every domain term (Bottleneck, Poll, Blocker, Auto-Heal, Hysteresis, etc.) is defined here with precise behavioral invariants. When a term appears in code or discussion, its meaning is whatever CONTEXT.md says it is.
+3. **`docs/adr/`** — Architecture Decision Records. Records of specific design decisions with rationale, rejected alternatives, and consequences. ADR 0001 (fail-fast startup config) is the first. Every ADR's decision is binding unless superseded by a later ADR.
+
+**Rules:**
+- When `draft-prd.md` and `CONTEXT.md` conflict on a domain definition, `CONTEXT.md` wins (it is more detailed and was refined after the PRD).
+- When `CONTEXT.md` or `draft-prd.md` reference a design decision documented in an ADR, the ADR's reasoning and constraints are authoritative.
+- New code must not violate any invariant stated in these three sources. If an implementation requires a change to an invariant, the PR must first update the relevant source.
+- README.md and other docs are derived from these three — treat them as helpful summaries but not authoritative.
+
+## Truth Sources (Programming Rules)
+
+1. **`PLAN_RULES.md`** — Plan-writing rules. Wajib dibaca dan diikuti saat membuat plan / plan mode. Setiap plan harus sesuai struktur, step-writing rules, dan verification yang ditetapkan.
+2. **`CODE_RULES.md`** — Code-writing rules. Wajib diikuti saat menulis kode: DRY, KISS, YAGNI, ≤120 baris per file, komentar hanya "why", unit test untuk logic.
+
 ## Agent Skills
 
 - **Issue tracker:** local markdown under `.scratch/`. See `docs/agents/issue-tracker.md`.
@@ -66,7 +85,7 @@ bd close <id>         # Complete work
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **mariadb-bottlenect-monitor** (38 symbols, 34 relationships, 0 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **mariadb-bottlenect-monitor** (415 symbols, 751 relationships, 14 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 

@@ -19,6 +19,7 @@ Complete every box **before** writing a plan or any code:
   - Resolve the library, then pull current docs before choosing any API, version, or pattern. Never rely on memory for library usage.
 - [ ] **Read domain + decisions** — `CONTEXT.md` for terms, `docs/adr/` for prior decisions that constrain the design.
 - [ ] **Read the whole plan and confirm understanding** before writing a single line of code.
+- [ ] **`CODE_RULES.md` wajib diikuti** saat menulis kode — pastikan DRY, KISS, YAGNI, ≤120 baris per file, naming jelas, komentar hanya untuk "why", dan unit test untuk logic/edge case.
 
 ---
 
