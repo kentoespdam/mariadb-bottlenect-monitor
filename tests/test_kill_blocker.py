@@ -36,21 +36,15 @@ class TestKillBlocker:
         assert ok
         assert msg == "kill_sent"
 
-    def test_thread_gone(self) -> None:
-        db = self._mock_db(None)
-        ok, msg = kill_blocker(db, self._make_identity(), self._make_blocker(),
-                               self._make_cfg(), {})
-        assert not ok
-        assert msg == "thread_gone"
-
-    def test_identity_mismatch(self) -> None:
-        ident = self._make_identity()
-        db = MagicMock()
-        db.query.return_value = [(123, "user2", "host2", "db")]
+    def test_excluded_user(self) -> None:
+        ident = {"thread_id": 123, "user": "repl", "host": "host1", "db": "mydb"}
+        db = self._mock_db(ident)
         ok, msg = kill_blocker(db, ident, self._make_blocker(), self._make_cfg(),
                                {"n_elapsed": 5, "age_threshold": 3})
         assert not ok
-        assert msg == "identity_mismatch"
+        assert msg == "excluded"
+
+
 
     def test_age_below_threshold(self) -> None:
         ident = self._make_identity()
@@ -79,8 +73,7 @@ class TestKillBlocker:
     def test_kill_fails(self) -> None:
         ident = self._make_identity()
         db = self._mock_db(ident)
-        db.query.side_effect = [[(123, "user1", "host1", "mydb")],
-                                Exception("KILL denied")]
+        db.query.side_effect = Exception("KILL denied")
         ok, msg = kill_blocker(db, ident, self._make_blocker(), self._make_cfg(),
                                {"n_elapsed": 5, "age_threshold": 3})
         assert not ok

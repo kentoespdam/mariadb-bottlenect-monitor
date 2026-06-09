@@ -165,18 +165,48 @@ def phase_two(db: DatabaseConnection) -> dict[str, Any] | None:
     except Exception as exc:
         log.warning("Phase two INNODB_LOCK_WAITS query failed: %s", exc)
 
-    # --- attempt 2: parse SHOW ENGINE INNODB STATUS ---
+    # --- attempt 2: query INNODB_TRX directly for blocker ---
+    try:
+        rows = db.query("""
+            SELECT
+                t.trx_mysql_thread_id AS thread_id,
+                p.USER AS user,
+                p.HOST AS host,
+                t.trx_started,
+                t.trx_query AS query_text,
+                t.trx_rows_locked,
+                (SELECT COUNT(*) FROM information_schema.INNODB_TRX wt
+                 WHERE wt.trx_wait_started IS NOT NULL) AS waiter_count
+            FROM information_schema.INNODB_TRX t
+            LEFT JOIN information_schema.PROCESSLIST p
+                ON t.trx_mysql_thread_id = p.ID
+            WHERE t.trx_rows_locked > 0
+            ORDER BY t.trx_started ASC
+            LIMIT 1
+        """)
+        if rows:
+            row = rows[0]
+            return {
+                "thread_id": int(row[0]),
+                "user": str(row[1] or ""),
+                "host": str(row[2] or ""),
+                "trx_started": str(row[3] or ""),
+                "query_text": str(row[4] or ""),
+                "waiter_count": int(row[6]),
+            }
+    except Exception as exc:
+        log.warning("Phase two INNODB_TRX query failed: %s", exc)
+
+    # --- attempt 3: parse SHOW ENGINE INNODB STATUS ---
     try:
         rows = db.query("SHOW ENGINE INNODB STATUS")
         if not rows:
             return None
-        # Status is the third column (index 2)
         status_text = str(rows[0][2]) if rows and len(rows[0]) > 2 else ""
         return _parse_lock_waits_from_status(status_text)
     except Exception as exc:
         log.error("Phase two (INNODB STATUS parse) failed: %s", exc)
         return None
-
 
 def run_poll(
     db: DatabaseConnection,

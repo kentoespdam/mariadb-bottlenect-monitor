@@ -45,7 +45,7 @@ def schedule_polls(
                 "n_counter": n_counter.value,
                 "k_counter": k_counter.value,
                 "bottleneck_state": bottleneck_state.is_set,
-                "blockers": result.blockers if hasattr(result, "blockers") else None
+                "blockers": result.blocker if hasattr(result, "blocker") else None
             })
         except DatabaseError as exc:
             log.error("DB error in poll cycle: %s", exc)
