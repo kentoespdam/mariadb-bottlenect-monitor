@@ -45,7 +45,7 @@ DEFAULTS: dict[str, int | float | bool | str] = {
     "log_max_files": 5,
     "log_retention_days": 30,
     "bot_poll_interval_sec": 2.0,
-    "status_interval_sec": 1800,
+    "status_interval_sec": 3600,
 }
 
 FLOOR_N_M = 1

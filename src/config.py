@@ -45,7 +45,7 @@ class Config:
     telegram_chat_id: str = ""
     alert_send_timeout_sec: int = 5
     bot_poll_interval_sec: float = 2.0
-    status_interval_sec: int = 1800
+    status_interval_sec: int = 3600
 
     monitor_user: str = "monitor"
     monitor_host: str = "127.0.0.1"
