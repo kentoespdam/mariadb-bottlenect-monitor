@@ -13,7 +13,7 @@ def cmd_status(db: DatabaseConnection) -> str:
 
 
 def cmd_threads(db: DatabaseConnection) -> str:
-    rows = db.query("SHOW GLOBAL STATUS LIKE 'Threads_%'")
+    rows = db.query("SHOW GLOBAL STATUS LIKE 'Threads_%%'")
     lines = ["THREAD STATUS", ""]
     for row in rows:
         lines.append(f"{row[0]}: {row[1]}")
