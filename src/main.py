@@ -6,6 +6,7 @@ import argparse
 import logging
 import signal
 import sys
+import time
 
 from .config import load_config
 from .counters import KCounter, NCounter
@@ -16,6 +17,8 @@ from .scheduler import schedule_polls
 from .state import StateToggle
 from .telegram_alert import TelegramAlert
 from .auto_heal import kill_blocker, resolve_blocker_identity
+from .status_report import fetch_status, format_status_report
+from .telegram_bot import TelegramBot
 
 log = logging.getLogger(__name__)
 
@@ -49,6 +52,7 @@ def _on_result(
     blocker_state: dict,
     telegram: TelegramAlert,
     prev_bottleneck: list[bool],
+    last_status_sent: list[float],
 ) -> None:
     """Log poll cycle state and trigger auto-heal when conditions are met."""
     if result.phase_one_ok:
@@ -76,6 +80,18 @@ def _on_result(
                 "action": "Bottleneck resolved — threads_running kembali normal",
             })
         prev_bottleneck[0] = bottleneck.is_set
+
+        # --- Periodic status report ---
+        now = time.time()
+        if (cfg.status_interval_sec > 0
+                and now - last_status_sent[0] >= cfg.status_interval_sec):
+            try:
+                status = fetch_status(db)
+                report = format_status_report(status)
+                _send_telegram(telegram, "status_report", {"text": report})
+            except Exception:
+                log.debug("Status report failed", exc_info=True)
+            last_status_sent[0] = now
 
         # Auto-heal: track blocker age and kill when threshold reached
         if cfg.auto_heal and result.blocker is not None:
@@ -172,6 +188,7 @@ def main() -> None:
     k_counter = KCounter(cfg.K)
     bottleneck_state = StateToggle("bottleneck")
     prev_bottleneck: list[bool] = [False]
+    last_status_sent: list[float] = [time.time()]
     log.info("State machine ready: N_threshold=%d, K_threshold=%d", cfg.N, cfg.K)
 
     signal.signal(signal.SIGTERM, _handle_signal)
@@ -185,6 +202,10 @@ def main() -> None:
     }
     asyncio.run(telegram.send("started", data))
 
+    bot = TelegramBot(cfg, db)
+    if telegram_enabled:
+        bot.start()
+
     blocker_state: dict = {}
 
     try:
@@ -197,12 +218,13 @@ def main() -> None:
             durable,
             lambda r: _on_result(
                 r, n_counter, k_counter, bottleneck_state, cfg, db, durable,
-                blocker_state, telegram, prev_bottleneck,
+                blocker_state, telegram, prev_bottleneck, last_status_sent,
             ),
         )
     except KeyboardInterrupt:
         log.info("Shutdown requested")
     finally:
+        bot.stop()
         durable.close()
         log.info("Monitor stopped")
 

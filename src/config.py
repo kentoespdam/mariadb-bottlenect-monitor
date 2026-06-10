@@ -44,6 +44,8 @@ class Config:
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     alert_send_timeout_sec: int = 5
+    bot_poll_interval_sec: float = 2.0
+    status_interval_sec: int = 1800
 
     monitor_user: str = "monitor"
     monitor_host: str = "127.0.0.1"
@@ -95,6 +97,8 @@ def load_config() -> Config:
         telegram_bot_token=_env_str("TELEGRAM_BOT_TOKEN", ""),
         telegram_chat_id=_env_str("TELEGRAM_CHAT_ID", ""),
         alert_send_timeout_sec=_env_int("ALERT_SEND_TIMEOUT_SEC", DEFAULTS["alert_send_timeout_sec"]),
+        bot_poll_interval_sec=_env_float("BOT_POLL_INTERVAL_SEC", DEFAULTS["bot_poll_interval_sec"]),
+        status_interval_sec=_env_int("STATUS_INTERVAL_SEC", DEFAULTS["status_interval_sec"]),
         monitor_user=_env_str("MONITOR_USER", "monitor"),
         monitor_host=_env_str("MONITOR_HOST", "127.0.0.1"),
     )
