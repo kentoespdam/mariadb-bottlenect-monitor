@@ -95,7 +95,7 @@ class TestDispatch:
     def test_status_calls_fetch(self) -> None:
         bot, _, db = _make_bot()
         db.query_one.return_value = ("Threads_running", "5")
-        with patch("src.telegram_bot.fetch_status", return_value={"Threads_running": 5, "Uptime": 100, "Questions": 100, "Slow_queries": 0, "Innodb_buffer_pool_read_requests": 1000, "Innodb_buffer_pool_reads": 10, "Threads_connected": 10}):
+        with patch("src.bot_commands.fetch_status", return_value={"Threads_running": 5, "Uptime": 100, "Questions": 100, "Slow_queries": 0, "Innodb_buffer_pool_read_requests": 1000, "Innodb_buffer_pool_reads": 10, "Threads_connected": 10}):
             with patch.object(bot, "_send_reply") as mock_reply:
                 bot._dispatch("/status", "123")
                 mock_reply.assert_called_once()

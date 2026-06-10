@@ -8,9 +8,9 @@ from typing import Any
 
 import httpx
 
+from . import bot_commands as cmd
 from .config import Config
 from .db import DatabaseConnection
-from .status_report import fetch_status, format_status_report
 from .telegram_alert import _API_BASE
 
 log = logging.getLogger(__name__)
@@ -65,67 +65,20 @@ class TelegramBot:
 
     def _dispatch(self, command: str, chat_id: str) -> None:
         handlers = {
-            "/status": self._cmd_status,
-            "/threads": self._cmd_threads,
-            "/processlist": self._cmd_processlist,
-            "/config": self._cmd_config,
-            "/help": self._cmd_help,
+            "/status": lambda: cmd.cmd_status(self._db),
+            "/threads": lambda: cmd.cmd_threads(self._db),
+            "/processlist": lambda: cmd.cmd_processlist(self._db),
+            "/config": lambda: cmd.cmd_config(self._cfg),
+            "/help": lambda: cmd.cmd_help(),
         }
         handler = handlers.get(command)
-        if handler:
-            try:
-                handler(chat_id)
-            except Exception:
-                log.debug("Command %s failed", command, exc_info=True)
-                self._send_reply(chat_id, "Error processing command")
-
-    def _cmd_status(self, chat_id: str) -> None:
-        data = fetch_status(self._db)
-        self._send_reply(chat_id, format_status_report(data))
-
-    def _cmd_threads(self, chat_id: str) -> None:
-        rows = self._db.query("SHOW GLOBAL STATUS LIKE 'Threads_%'")
-        lines = ["THREAD STATUS", ""]
-        for row in rows:
-            lines.append(f"{row[0]}: {row[1]}")
-        self._send_reply(chat_id, "\n".join(lines))
-
-    def _cmd_processlist(self, chat_id: str) -> None:
-        sql = ("SELECT ID, USER, HOST, DB, TIME, INFO "
-               "FROM information_schema.PROCESSLIST "
-               "WHERE COMMAND != 'Sleep' ORDER BY TIME DESC LIMIT 10")
-        rows = self._db.query(sql)
-        if not rows:
-            self._send_reply(chat_id, "No active queries")
+        if not handler:
             return
-        lines = ["ACTIVE QUERIES (top 10)", ""]
-        for r in rows:
-            q = (r[5] or "")[:80]
-            lines.append(f"ID:{r[0]} {r[1]}@{r[2]} db={r[3]} {r[4]}s")
-            if q:
-                lines.append(f"  {q}")
-        self._send_reply(chat_id, "\n".join(lines))
-
-    def _cmd_config(self, chat_id: str) -> None:
-        c = self._cfg
-        text = (
-            "MONITOR CONFIG\n"
-            "\n"
-            f"entry={c.threads_entry} exit={c.threads_exit}\n"
-            f"N={c.N} M={c.M} K={c.K} J={c.J}\n"
-            f"auto_heal={c.auto_heal}\n"
-            f"poll_interval={c.poll_interval_sec}s\n"
-            f"kill_exclusion={','.join(c.kill_exclusion) or 'none'}"
-        )
-        self._send_reply(chat_id, text)
-
-    def _cmd_help(self, chat_id: str) -> None:
-        self._send_reply(chat_id, "AVAILABLE COMMANDS\n\n"
-                         "/status - Server health report\n"
-                         "/threads - Thread status counters\n"
-                         "/processlist - Active queries (top 10)\n"
-                         "/config - Monitor configuration\n"
-                         "/help - This message")
+        try:
+            self._send_reply(chat_id, handler())
+        except Exception:
+            log.debug("Command %s failed", command, exc_info=True)
+            self._send_reply(chat_id, "Error processing command")
 
     def _send_reply(self, chat_id: str, text: str) -> None:
         url = f"{_API_BASE}{self._token}/sendMessage"
