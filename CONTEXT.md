@@ -22,9 +22,13 @@ two.
 
 A poll has **two sequential phases**, not one combined query, and the second runs only
 on demand. Phase one is *detection*: a cheap `SHOW GLOBAL STATUS` read of
-`Threads_running` that every poll always performs. Phase two is *attribution*: querying
-the lock-wait chain (`sys.innodb_lock_waits`) to find the Blocker — and this runs **only
-when phase one finds `Threads_running` above the entry threshold**. When the database is
+`Threads_running` that every poll always performs. Phase two is *attribution*: detecting the lock-blocking transaction via a 3-fallback
+strategy — and this runs **only when phase one finds `Threads_running` above the entry threshold**.
+The fallback order: (a) `information_schema.innodb_lock_waits` (standard MariaDB
+lock-wait view), (b) `information_schema.INNODB_TRX` (direct query for oldest transaction
+holding locks), (c) `SHOW ENGINE INNODB STATUS` with regex parsing of `LOCK WAIT` sections
+for the CONFLICTING transaction. Each falls through to the next if it errors or returns empty.
+Attribution fails (returns no Blocker) only when all three fail. When the database is
 healthy the poll stops after phase one. The reason is load: the lock-wait query is far
 heavier than the status read and its result is almost always empty under normal load, so
 running it every second would add needless pressure to the very database the monitor
@@ -71,8 +75,9 @@ with the others. **Phase one is the gate.** The sequence is:
 5. **If above entry → run phase two (attribution)**, the lock-wait-chain query.
 6. **If attribution fails → [[attribution-blindness]]:** `J++`, no target, no kill.
 7. **If attribution succeeds and** N is satisfied **and** M has elapsed **and** a
-   non-[[kill-exclusion|excluded]] root exists → **issue the single `KILL QUERY`** (then
-   start M). At most one kill is *sent* per poll.
+   non-[[kill-exclusion|excluded]] root exists → **issue the single kill** (`KILL QUERY` for
+   an active root, `KILL` for an idle-in-trx root — see [[auto-heal]]), then start M. At most
+   one kill is *sent* per poll.
 8. **Write the audit/alert** dictated by any state transition this poll.
 
 The load-bearing point is step 2 versus the rest: the **temporal** counter M is ticked by
@@ -174,22 +179,25 @@ single boot instead of fixing them one crash-loop at a time. This ordering serve
 The initial MariaDB connection is **not** [[monitor-blindness]]. Monitor Blindness is the
 loss of a connection that was already standing — its K counter measures polls lost from a
 *running* baseline, and its freeze protects state that already exists. At boot there is no
-baseline, no poll, no state to freeze, so K does not apply. Instead, the initial connect
-splits by failure kind. A **transient** failure (connection refused / timeout — the DB
-merely not ready yet, common when the monitor and MariaDB containers co-start) gets a
-**bounded retry with short backoff** before giving up; this absorbs the benign race without
-masking a real problem. An **auth or misconfiguration** failure (credentials rejected, wrong
-port answering) is *not* "not ready yet" — it is incoherent config, so it refuses immediately
-with no retry, exactly like a malformed tunable. Either way, exhausting the bounded retry or
-hitting an immediate refusal means **exit non-zero** and let `Restart=always` surface it as a
-visible crash-loop — the monitor never enters its poll loop on a dead connection, because
-doing so would disguise a startup misconfiguration as runtime blindness.
+baseline, no poll, no state to freeze, so K does not apply. The initial connect has
+**no retry at all**: `db.connect()` is called once, and any failure (transient or permanent)
+propagates as an immediate exception and process exit. There is no bounded-retry-with-backoff
+or transient-vs-auth split at startup. The original architectural intention was to
+distinguish transient from auth failure with separate fallback paths, but V1 code is
+simpler: connect once, fail fast, let `Restart=always` surface it as a crash-loop. The
+monitor never enters its poll loop on a dead connection — it dies immediately, and Docker
+restarts it, which naturally retries the connection from scratch. A consequence: a brief
+startup race (monitor and MariaDB containers co-starting) produces repeated crash-loop
+restarts until the database is ready, rather than a graceful in-process wait. This is
+acceptable because `Restart=always` keeps retrying, and the crash-loop seconds are visible
+in container logs.
 
 ### Blocker
 The single thread holding a lock that other threads are waiting on. The Blocker is
 the root cause the system tries to identify — it is *not* simply the longest-running
-or most recent query. Identified via the lock-wait chain (`sys.innodb_lock_waits`,
-or `information_schema` as a fallback).
+or most recent query. Identified via the 3-fallback attribution strategy: `information_schema.innodb_lock_waits`,
+`information_schema.INNODB_TRX` (oldest transaction holding locks), or `SHOW ENGINE INNODB STATUS`
+regex parse of `LOCK WAIT` sections as the final fallback.
 
 When the lock-wait chain reveals more than one waiting relationship, the Blocker the
 system targets is the **deepest root** — the thread that holds a lock *and is not
@@ -211,24 +219,19 @@ least likely to clear on its own and most likely to be genuinely stuck. Note thi
 discipline of [[auto-heal]].
 
 ### Auto-Heal
-The act of cancelling the Blocker's running query to relieve a Bottleneck —
-specifically `KILL QUERY` (abort the statement, keep the connection alive), not a
-full `KILL CONNECTION`. Cancelling the statement rolls back its transaction and
-releases the lock, which is what frees the Bottleneck. Auto-Heal is opt-in and
-defaults to OFF; by default the system is alert-only. Known blind spot: an *idle*
-transaction holding a lock with no active statement has no query to cancel, so
-`KILL QUERY` cannot release it — this case is accepted for V1 because the dominant
-scenario is one heavy running query holding the lock, not an idle-in-transaction
-session. When attribution does name an idle root, it gets **no special handling**: the
-`KILL QUERY` is sent, the server accepts it syntactically, and — exactly as with any
-kill — the poll loop, never the return code, decides whether it worked. An impotent
-kill against an idle transaction is indistinguishable at the return-code layer from a
-kill whose effect is merely slow to drain; both surface only as "the Bottleneck is
-still here next poll." It therefore falls through the existing path: [[heal-cooldown]]
-withholds the next attempt, and if the Bottleneck outlasts the cooldown it is already
-in the "beyond healing capability, left for the operator" state that is locked
-elsewhere. The idle-transaction blind spot is thus not a new signal or state — it is one
-*instance* of "a kill may have no effect, and the poll loop is the verifier."
+The act of killing the Blocker to relieve a Bottleneck, **escalated by the Blocker's
+liveness** (see [ADR 0002](docs/adr/0002-targeted-kill-escalation-idle-blockers.md)): an
+*active* Blocker (a running statement) is cancelled with `KILL QUERY` (abort the statement,
+keep the connection alive); an *idle-in-transaction* Blocker — one holding a lock with no
+running statement — is severed with `KILL` (drop the connection), because it has no query to
+cancel. Either way the Blocker's transaction rolls back and releases the lock, which is what
+frees the Bottleneck. Liveness is read from a single fresh snapshot taken immediately before
+the kill, the same read that performs [[blocker-identity-resolution]]. Auto-Heal is opt-in
+and defaults to OFF; by default the system is alert-only. Whichever kill is sent, the poll
+loop — never the return code — decides whether it worked: a kill whose effect is slow to
+drain and one that did nothing both surface only as "the Bottleneck is still here next poll,"
+so [[heal-cooldown]] withholds the next attempt, and a Bottleneck that outlasts the cooldown
+is in the "beyond healing capability, left for the operator" state locked elsewhere.
 
 Auto-Heal issues **exactly one kill per poll** — it cancels the single chosen
 [[blocker]] (the deepest root, tie-broken by waiter count), then *stops and lets the
@@ -434,9 +437,12 @@ This is why the monitor holds **one persistent connection across polls** rather 
 opening a fresh one each poll: a per-poll connect would pile connect/auth load onto
 the very database it is protecting, and doing so every second is at its most fragile
 exactly when `max_connections` is full. When a poll fails because that persistent
-connection died, the monitor attempts to **reconnect on the next poll** (for V1: every
-poll, no backoff — the ~1s poll interval is its natural rate limit), and each failed
-reconnect attempt simply counts as one more failed poll accumulating toward K.
+connection died, the monitor attempts to **reconnect up to 10 times** (each attempt
+retried on the next poll cycle — the ~1s poll interval is its natural rate limit), and
+each failed reconnect attempt simply counts as one more failed poll accumulating toward K.
+After 10 consecutive reconnect failures, the monitor logs "max reconnects reached" and
+stops further reconnect attempts (polls continue and K keeps advancing, but no reconnect
+is attempted). A full reconnect cycle (e.g. container restart) can reset the counter.
 
 Cause-agnostic at the **state** level does not mean cause-blind at the **forensic**
 level. The two operationally distinct realities behind a blind poll — *server alive,
@@ -542,25 +548,25 @@ an un-clearing Bottleneck whose entry alert is never closed by a [[recovery-aler
 is itself the honest signal ("Bottleneck won't clear despite Auto-Heal ON"). No crisis
 goes silent.
 
-Heal Capability Failure fires on the **first** privilege rejection — its effective threshold
-is **one**, and it deliberately gets **no poll-count tunable of its own**. The four tunables
-N (Sustained Bottleneck), M (Heal Cooldown), K (Monitor Blindness), and J (Attribution
-Blindness) are the **complete and final** set; this condition adds no fifth. The reason is a
-fundamental difference in what it is sieving. N, K, and J all exist to ride out **transients** —
-a momentary load spike, a single lock-wait query that times out, one dropped `SHOW GLOBAL
-STATUS` — each of which can self-heal on the very next poll, so "wait a few polls before
-alerting" suppresses chatter without hiding anything real. A privilege rejection is the
-opposite: it is **deterministic and structural**. If `monitor_user` lacks `CONNECTION ADMIN`,
-it will not spontaneously acquire it next poll — only an admin `GRANT` changes the outcome.
-Waiting J polls for a result guaranteed to repeat identically would merely *delay the alert on
-the most dangerous silent failure mode* while filtering nothing. The kill error code already
-draws the line cleanly — an "access denied" / privilege error is structural (alert at once),
-whereas `Unknown thread id` is the target vanishing (a benign, syntactically-accepted outcome
-that arms nothing) and a send timeout is the transient class routed to the poll loop above. So
-syntactic classification of the error code does all the separating a tunable would, without one.
-Its [[recovery-alert]] has a single unambiguous exit: a `KILL` **succeeds again** after a prior
-rejection — i.e. the admin has granted the privilege — closing the loop the first rejection
-opened.
+Heal Capability Failure in the V1 code is **startup-only**: the monitor checks
+privilege via `SHOW GRANTS` (looking for `SUPER` or `ALL PRIVILEGES`) once at startup
+and logs whether it has the right. There is **no runtime detection of kill rejection**:
+if a `KILL QUERY` fails at runtime, the error is logged and returned as a failed
+kill outcome, but it does **not** escalate as a separate Heal Capability Failure alert
+and does **not** enter a dedicated failure state with its own recovery. The V1 kill
+path (`kill_blocker` in `auto_heal.py`) returns a `(success, outcome)` tuple — a failed
+kill is simply `(False, "kill_failed: ...")`, written to the durable log as an
+`auto_heal` event, and a Telegram failure notification is sent. There is no
+state-toggled boolean for this condition, no dedicated alert type, and no automatic
+recovery alert.
+
+The architectural design (above) describes a richer capability-failure state machine
+with first-privilege-rejection immediate alerting, a dedicated state toggle with
+up/down edges, and explicit recovery. **This is aspirational and not yet implemented.**
+The V1 code takes a simpler approach: log the failure, notify once via Telegram,
+and let the poll loop re-evaluate naturally. Adding the full Heal Capability Failure
+state machine with runtime detection, dedicated alert escalation, and recovery alert
+is a planned enhancement.
 
 ### Alert Payload
 The deliberately minimal content of a real-time notification — sized to let an
@@ -603,19 +609,19 @@ approved system-initiated templates — is deliberately *not* in V1. The channel
 outbound network that
 can fail precisely when it is most needed — a struggling server often means a struggling
 network, so the moment an operator most needs the alert is the moment delivery is most
-likely to drop. To keep that from becoming a brand-new *silent* blindness — the system
-"believing" it notified when the message never landed — the **outcome of each send attempt
-(delivered / failed-to-send, with the failure kind) is itself written to the durable log**.
-A failed delivery is therefore never thrown into the void; it becomes one more greppable
-line, so an operator can always reconstruct the full truth from the log even with the
-notification channel entirely down. This is the same separation that governs
-[[alert-payload]] — *alert is for deciding, the durable record is for truth* — extended one
-level: an external channel is structurally unfit to be a source of truth because it is at
-its most fragile during a crisis. A consequence accepted here: an operator who watches only
-the chat channel and never reads the log can still miss an alert that failed to send — but
-that is **not** silent blindness *from the system's side*, which recorded the attempt
-honestly; reading the durable log is the operator's responsibility, consistent with "the
-system reports, it does not guess". Retry or a second escalation channel (try WhatsApp when
+likely to drop. The architectural intention is that the **outcome of each send attempt
+(delivered / failed-to-send, with the failure kind) is itself written to the durable log**,
+so a failed delivery is never thrown into the void and an operator can always reconstruct
+the full truth from the log even with the notification channel entirely down. This is the
+same separation that would govern [[alert-payload]] — *alert is for deciding, the durable
+record is for truth* — extended one level.
+
+**V1 status: delivery outcome is NOT yet written to the durable log.** The current
+`TelegramAlert.send()` uses `log.warning()` only for failures (timeout, non-200 status,
+exception) with no `durable.append()` call. An operator relying on the durable log as the
+single source of truth will NOT find Telegram delivery failures there in V1; those are
+visible only in container stdout logs. Writing delivery outcomes to the durable log is a
+planned enhancement consistent with the architectural design described here. Retry or a second escalation channel (try WhatsApp when
 Telegram fails) is a legitimate enhancement on top of this — and is **explicitly deferred
 beyond V1**, not built now — but it is never a *replacement* for the contract: the end of
 any delivery chain can still fail, so the durable log remains the floor. Pinning a single
@@ -631,10 +637,34 @@ exactly that moment, and an un-bounded HTTP POST to the channel could hang for t
 seconds. If that send ran inline and unbounded, the next poll would be delayed and the
 monitor would go blind in the middle of the very crisis it is watching — the same
 "monitor must never become the cause of the crisis it monitors" principle that bounds the
-[[durable-log]]. So the send is capped by a short, explicit timeout; on expiry it is recorded
-as `failed-to-send (timeout)` — one more greppable failure kind on the durable log — and the
-poll loop proceeds without waiting. Delivery is best-effort and low-value next to keeping the
-detection heartbeat steady; it is therefore never granted the power to hold a poll hostage.
+[[durable-log]]. So the send is capped by a short, explicit timeout; on expiry it is logged
+as a warning and the poll loop proceeds without waiting. Delivery is best-effort and low-value
+next to keeping the detection heartbeat steady; it is therefore never granted the power to
+hold a poll hostage.
+
+### Interactive Telegram Bot
+Alongside the alert channel, a **command-response bot** runs as a background daemon thread,
+polling `getUpdates` on the Telegram Bot API and dispatching user commands. It provides
+interactive access to live database state without requiring shell access to the monitor
+container. Registered commands (via `setMyCommands`):
+`/status` — full server health report (Uptime, Threads running/connected, Questions/QPS,
+Slow queries, Buffer pool hit rate); `/threads` — raw `Threads_%` status counters;
+`/processlist` — top 10 non-sleep active queries ordered by time; `/config` — current
+monitor configuration (thresholds, tunables, exclusion list); `/help` — available commands.
+The bot also sends a persistent keyboard menu after each command for one-tap access.
+
+The bot is a **best-effort companion** to the alert system, not a replacement: it shares
+the same Telegram token, runs on its own poll cadence (`bot_poll_interval_sec`, default 2s),
+and logs but never crashes the main poll loop on error. The bot is enabled automatically
+whenever a `TELEGRAM_BOT_TOKEN` is configured.
+
+### Periodic Status Report
+On a configurable interval (`STATUS_INTERVAL_SEC`, default 3600s), the monitor sends a
+proactive health summary over the Telegram alert channel (not via the bot, but as a regular
+`sendMessage`). The report includes Uptime, Threads running/connected, Questions count and
+approximate QPS, Slow queries count, and InnoDB buffer pool hit rate. The send uses the same
+best-effort HTTP POST with per-type rate limiting as all other alerts. Like every alert, it
+is informational only — the durable log remains the source of truth.
 
 ### State Toggle
 The **edge-triggered** mechanism that makes every lingering state notify only on its
@@ -753,8 +783,8 @@ The truth must rest on something both local *and* persistent. Writing additional
 stdout (for `docker logs`) is a permitted convenience, but it is never the source of truth —
 only the durable host-backed file is.
 
-Durability does not mean *unbounded*: the Durable Log is **rotated with a guaranteed disk
-ceiling**, because a source of truth that grows without limit is itself a liability — on a
+Durability does not mean *unbounded*: the Durable Log **should** be rotated with a guaranteed
+disk ceiling, because a source of truth that grows without limit is itself a liability — on a
 frequently-bottlenecked server the audit trail could swell until it fills the host disk, and
 a full host disk can topple MariaDB itself, making the forensic log the *cause* of the very
 crisis it exists to watch. So a monitor must never become the source of the crisis it
@@ -767,6 +797,15 @@ how many days) are operator policy, tuned per workload and host-disk size exactl
 detection thresholds are — no universal default is claimed. An operator who sets a short
 retention accepts the consequence that the "weeks later" audit window shrinks to match; that
 is an honest, explicit trade the operator makes, not a silent loss the system hides.
+
+**V1 status: rotation is configured but not yet implemented.** Config fields `LOG_MAX_SIZE_MB`,
+`LOG_MAX_FILES`, and `LOG_RETENTION_DAYS` are parsed but unused — the current code writes a
+single append-only JSONL file with no size cap, no rotation, and no time-based pruning.
+The log grows unbounded from startup. This is acceptable for V1 because (a) the log volume
+per poll is small (one JSON line per cycle), (b) a typical deployment is monitored, not
+abandoned, so the operator notices disk growth, and (c) the rotation mechanism can be added
+without changing the log format or the append contract. Adding rotation is explicitly queued
+for a near-term V1 enhancement.
 
 Writability is not only a *startup* precondition but a **standing precondition for every
 destructive action**. If a log write fails *mid-run* — the host volume fills (`ENOSPC`) or
@@ -818,21 +857,16 @@ that identified it as the Blocker; and the `Threads_running` value at the moment
 the kill. The audit trail is durable and greppable (a rotated log file, never only
 the alert channel), so that no kill is ever unexplained.
 
-One kill is recorded as **two write-ahead lines, not one**, sharing a single
-**incident id** for correlation. The **intent line is written *before* the `KILL QUERY`
-is sent** — it records the decision: the chosen Blocker's full identity, the raw query
-text, the lock-wait chain that named it, and the `Threads_running` at the moment of
-decision. The **outcome line is written *after* the return code arrives** — it records
-the result: the syntactic classification only (succeeded / `Unknown thread id` /
-privilege-rejected / transient-timeout), never an *effect* claim, since the
-[[poll|poll loop]] alone verifies effect. This ordering is not tidiness but forensic
-honesty: a `KILL` that reaches the server while our own process dies *before* the return
-arrives is precisely the most dangerous case for an audit — the effect may have landed
-on the server with no result line on our side. Writing intent first guarantees no action
-is ever unrecorded, and an intent line with its outcome line *missing* is itself a
-forensic signal ("we decided and sent, then died mid-flight — inspect the server"). It
-is the same "report, never guess" discipline that makes the poll loop, not the return
-code, the verifier: the log records what we *did*, never what we *assume happened*.
+One kill is recorded as a **single line written *after* the kill attempt**, not two
+write-ahead lines. The record is a `durable.append()` with event type `auto_heal`,
+containing the thread_id, success boolean, outcome message, user, and host.
+There is **no intent line written before the `KILL QUERY`** and **no fsync guarantee**
+on the write. This is an acknowledged V1 simplification: the single post-execution line
+means a process crash that occurs *during* the `KILL` (after the server accepts it but
+before the log write lands) leaves no trace of the action. The trade is accepted because
+the `KILL` effect is still discovered by the next poll, and the poll-loop-reliant
+verification makes the gap tractable for V1. A two-line write-ahead pattern with fsync
+is deferred as a hardening enhancement.
 
 ### Hysteresis
 The deliberate gap between the threshold that *enters* a Bottleneck state and the
@@ -974,3 +1008,89 @@ The system NEVER guesses a victim here (e.g. it will not kill the longest-runnin
 query) — that would violate the principle that killing is driven by lock-holding,
 not duration. An Unattributed Bottleneck is alert-only and always requires human
 judgement, regardless of whether Auto-Heal is ON.
+
+## Implementation Status
+
+This section documents which features described in this glossary are implemented
+in V1 code vs. aspirational/planned.
+
+### Implemented in V1
+
+- **Detection + fixed-delay polling** — `SHOW GLOBAL STATUS` phase one, lazy two-phase
+  with phase two only on detection, fixed-delay scheduling with no overlap (scheduler.py, poll.py:36-38)
+- **Phase two attribution with 3 fallbacks** — `information_schema.innodb_lock_waits`,
+  `information_schema.INNODB_TRX`, `SHOW ENGINE INNODB STATUS` regex (poll.py:130-209)
+- **N/K counters** — NCounter (sustained bottleneck poll count), KCounter (blindness)
+  with freeze/unfreeze for observational counters (counters.py)
+- **Hysteresis state toggle** — entry/exit thresholds, StateToggle edge-triggered
+  boolean with freeze (state.py)
+- **Auto-Heal (targeted KILL escalation)** — opt-in, one kill per poll, `KILL QUERY` for
+  active / `KILL` for idle-in-trx blockers, allowlist + monitor-self exclusion on a fresh
+  resolved identity (auto_heal.py; see ADR 0002)
+- **Startup config validation** — three-tier: absent patience→default, absent
+  detection→refuse, malformed→refuse, `exit < entry` coherence, counter floors
+  (config.py, _env.py)
+- **Telegram alerts** — async HTTP POST, per-type rate limiting (60s), configurable
+  timeout (telegram_alert.py)
+- **Interactive Telegram bot** — daemon thread, `getUpdates` polling, `/status`,
+  `/threads`, `/processlist`, `/config`, `/help` commands with keyboard menu (telegram_bot.py)
+- **Periodic status reports** — configurable interval (default 3600s), reports
+  Uptime/Threads/QPS/SlowQueries/BufferPool (status_report.py)
+- **Durable log** — append-only JSONL, writable-at-startup precondition, host-volume
+  backed (durable_log.py)
+- **Startup privilege check** — `SHOW GRANTS` logged once, no runtime kill-failure
+  escalation (auto_heal.py:33-47)
+- **Reconnect on poll error** — up to 10 attempts in poll loop, counter resets on
+  success (scheduler.py:50-83)
+- **Blocker identity resolution** — `PROCESSLIST` query, host port stripping, allowlist
+  matching (auto_heal.py:50-65)
+
+### V1 Behavioral Divergences
+
+V1 code implements a simplified version of the N counter that differs from canonical
+architecture but works effectively in practice. (The earlier per-blocker M divergence was
+removed when Auto-Heal adopted the canonical global [[heal-cooldown]] — see
+[ADR 0002](docs/adr/0002-targeted-kill-escalation-idle-blockers.md).)
+
+#### N: Accumulation Above Entry vs Above Exit
+
+**Canonical:** N increments while `Threads_running > exit_threshold` (throughout hysteresis band).
+
+**V1 code:** N increments only when `Threads_running > entry_threshold`.
+
+**Impact:** When tr is in hysteresis band (exit < tr ≤ entry), N pauses instead of accumulating.
+
+**Why V1 works:** More conservative threshold prevents premature kills from noisy signals
+near the boundary. First kill requires stronger sustained signal (tr > entry for N
+consecutive polls).
+
+#### Design Rationale
+
+This divergence trades canonical precision for operational simplicity:
+- **N conservative:** Reduces false positives from boundary noise at cost of slightly delayed first intervention
+
+Operational evidence (no wrong-kills, effective bottleneck resolution) validates this
+tradeoff for V1.
+
+### Planned / Not Yet Implemented
+
+- **Two-line write-ahead kill audit** — V1 logs single post-kill line; intent-before-kill
+  + fsync + outcome-after-kill is deferred (see Kill Audit Record section)
+- **Durable log rotation** — `LOG_MAX_SIZE_MB`/`LOG_MAX_FILES`/`LOG_RETENTION_DAYS` parsed
+  but unused; log grows unbounded (see Durable Log section)
+- **Startup connection retry** — V1 connects once with no retry; bounded retry with backoff
+  is planned (see Startup Config Contract section)
+- **Heal Capability Failure state machine** — V1 has startup privilege check only; no
+  runtime kill-rejection detection, no dedicated alert/recovery (see Heal Capability
+  Failure section)
+- **Delivery outcome logged to durable log** — V1 logs send failures only to Python logger,
+  not to `durable.append()` (see Alert Delivery Contract section)
+- **J counter (Attribution Blindness)** — defined in counters.py but not wired into the
+  poll loop; phase-two failure is logged but does not accumulate J or fire an attribution
+  blindness alert
+- **Dedicated recovery alerts** — V1 sends bottleneck up/down edge alerts but does not
+  implement the full recovery-alert system for all toggled conditions (monitor blindness,
+  heal capability failure, attribution blindness)
+- **Forensic failure-kind logging** — blindness/reconnect errors are logged with their
+  exception text but not the structured failure-kind classification (REFUSED/TIMEOUT/DROPPED)
+  described in the Monitor Blindness section

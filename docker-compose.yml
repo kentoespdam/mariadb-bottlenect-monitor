@@ -1,0 +1,7 @@
+services:
+  monitor:
+    build: .
+    restart: always
+    env_file: .env
+    volumes:
+      - ./data/monitor:/var/log/monitor
