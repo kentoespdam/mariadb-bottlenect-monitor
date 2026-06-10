@@ -24,7 +24,9 @@ def cmd_processlist(db: DatabaseConnection) -> str:
     sql = (
         "SELECT ID, USER, HOST, DB, TIME, INFO "
         "FROM information_schema.PROCESSLIST "
-        "WHERE COMMAND != 'Sleep' ORDER BY TIME DESC LIMIT 10"
+        "WHERE COMMAND != 'Sleep' "
+        "AND USER != 'monitor_test' "
+        "ORDER BY TIME DESC LIMIT 10"
     )
     rows = db.query(sql)
     if not rows:
@@ -32,7 +34,7 @@ def cmd_processlist(db: DatabaseConnection) -> str:
     lines = ["ACTIVE QUERIES (top 10)", ""]
     for r in rows:
         q = (r[5] or "")[:80]
-        lines.append(f"ID:{r[0]} {r[1]}@{r[2]} db={r[3]} {r[4]}s")
+        lines.append(f"ID:{r[0]} {r[1]}@{r[2]} db={r[3] or '-'} {r[4]}s")
         if q:
             lines.append(f"  {q}")
     return "\n".join(lines)
