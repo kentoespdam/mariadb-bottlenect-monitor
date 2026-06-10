@@ -9,14 +9,14 @@ import sys
 import time
 
 from .config import load_config
-from .counters import KCounter, NCounter
+from .counters import KCounter, MCounter, NCounter
 from .db import DatabaseConnection
 from .durable_log import DurableLog
 from .poll import PollResult
 from .scheduler import schedule_polls
 from .state import StateToggle
 from .telegram_alert import TelegramAlert
-from .auto_heal import kill_blocker, resolve_blocker_identity
+from .auto_heal import kill_blocker
 from .status_report import fetch_status, format_status_report
 from .telegram_bot import TelegramBot
 
@@ -49,7 +49,8 @@ def _on_result(
     cfg: Config,
     db: DatabaseConnection,
     durable: DurableLog,
-    blocker_state: dict,
+    m_counter: MCounter,
+    cooldown_active: list[bool],
     telegram: TelegramAlert,
     prev_bottleneck: list[bool],
     last_status_sent: list[float],
@@ -93,48 +94,33 @@ def _on_result(
                 log.debug("Status report failed", exc_info=True)
             last_status_sent[0] = now
 
-        # Auto-heal: track blocker age and kill when threshold reached
-        if cfg.auto_heal and result.blocker is not None:
+        # Auto-heal: N gates the first kill; the global M cooldown gates the gap
+        # between kills. N is not re-armed per kill (it resets only at exit).
+        if (cfg.auto_heal and result.blocker is not None
+                and n_counter.satisfied
+                and (not cooldown_active[0] or m_counter.satisfied)):
             blocker_id = result.blocker["thread_id"]
-            if blocker_id not in blocker_state:
-                blocker_state[blocker_id] = {"seen": 0, "identity": result.blocker}
-            blocker_state[blocker_id]["seen"] += 1
-
-            if blocker_state[blocker_id]["seen"] >= cfg.M:
-                identity = blocker_state[blocker_id]["identity"]
-                poll_state = {"n_elapsed": blocker_state[blocker_id]["seen"], "age_threshold": cfg.M}
-                success, msg = kill_blocker(db, identity, result.blocker, cfg, poll_state)
-                log.info("Auto-heal thread %d: success=%s msg=%s", blocker_id, success, msg)
-                durable.append({
-                    "event": "auto_heal",
+            success, outcome = kill_blocker(db, result.blocker, cfg)
+            log.info("Auto-heal thread %d: success=%s outcome=%s", blocker_id, success, outcome)
+            durable.append({
+                "event": "auto_heal",
+                "thread_id": blocker_id,
+                "success": success,
+                "outcome": outcome,
+            })
+            if success:
+                m_counter.reset()
+                cooldown_active[0] = True
+                _send_telegram(telegram, "auto_heal_killed", {
                     "thread_id": blocker_id,
-                    "success": success,
-                    "outcome": msg,
-                    "user": identity.get("user"),
-                    "host": identity.get("host"),
+                    "action": f"{outcome} thread {blocker_id}",
                 })
-                # --- Telegram: auto_heal result ---
-                if success:
-                    _send_telegram(telegram, "auto_heal_killed", {
-                        "thread_id": blocker_id,
-                        "user": identity.get("user"),
-                        "host": identity.get("host"),
-                        "action": f"KILL QUERY {blocker_id} — {msg}",
-                    })
-                    del blocker_state[blocker_id]
-                else:
-                    _send_telegram(telegram, "auto_heal_failed", {
-                        "thread_id": blocker_id,
-                        "user": identity.get("user"),
-                        "host": identity.get("host"),
-                        "error": msg,
-                        "action": f"Gagal kill thread {blocker_id}",
-                    })
-        elif result.blocker is None:
-            # Clear stale blocker tracking when no blocker detected
-            stale_ids = [bid for bid, s in blocker_state.items() if s["seen"] > cfg.M + 3]
-            for bid in stale_ids:
-                del blocker_state[bid]
+            else:
+                _send_telegram(telegram, "auto_heal_failed", {
+                    "thread_id": blocker_id,
+                    "error": outcome,
+                    "action": f"Gagal kill thread {blocker_id} ({outcome})",
+                })
     else:
         log.warning(
             "poll blind  K=%d/%s  N=%s",
@@ -186,8 +172,10 @@ def main() -> None:
 
     n_counter = NCounter(cfg.N)
     k_counter = KCounter(cfg.K)
+    m_counter = MCounter(cfg.M)
     bottleneck_state = StateToggle("bottleneck")
     prev_bottleneck: list[bool] = [False]
+    cooldown_active: list[bool] = [False]
     last_status_sent: list[float] = [time.time()]
     log.info("State machine ready: N_threshold=%d, K_threshold=%d", cfg.N, cfg.K)
 
@@ -206,8 +194,6 @@ def main() -> None:
     if telegram_enabled:
         bot.start()
 
-    blocker_state: dict = {}
-
     try:
         schedule_polls(
             cfg,
@@ -216,9 +202,10 @@ def main() -> None:
             k_counter,
             bottleneck_state,
             durable,
+            m_counter,
             lambda r: _on_result(
                 r, n_counter, k_counter, bottleneck_state, cfg, db, durable,
-                blocker_state, telegram, prev_bottleneck, last_status_sent,
+                m_counter, cooldown_active, telegram, prev_bottleneck, last_status_sent,
             ),
         )
     except KeyboardInterrupt:

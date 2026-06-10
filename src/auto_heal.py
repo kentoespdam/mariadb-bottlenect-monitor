@@ -48,9 +48,17 @@ def _check_privilege(db: DatabaseConnection) -> bool:
 
 
 def resolve_blocker_identity(db: DatabaseConnection, thread_id: int) -> dict[str, Any] | None:
-    """Resolve blocker user/host/db from SHOW PROCESSLIST."""
+    """Resolve blocker identity + liveness from a fresh PROCESSLIST snapshot.
+
+    COMMAND and INFO are read here (not reused from phase-two) so the kill-mode
+    decision keys off the thread's state at kill time, not a stale attribution.
+    """
     try:
-        rows = db.query("SELECT ID, USER, HOST, DB FROM information_schema.PROCESSLIST WHERE ID = %s", (thread_id,))
+        rows = db.query(
+            "SELECT ID, USER, HOST, DB, COMMAND, INFO "
+            "FROM information_schema.PROCESSLIST WHERE ID = %s",
+            (thread_id,),
+        )
         if not rows:
             return None
         row = rows[0]
@@ -59,39 +67,50 @@ def resolve_blocker_identity(db: DatabaseConnection, thread_id: int) -> dict[str
             "user": str(row[1] or ""),
             "host": _normalise_host(str(row[2] or "")),
             "db": str(row[3] or ""),
+            "command": str(row[4] or ""),
+            "info": str(row[5] or ""),
         }
     except Exception:
         log.exception("Identity resolution failed for thread %d", thread_id)
         return None
 
 
+def _is_idle(identity: dict[str, Any]) -> bool:
+    """Idle-in-transaction: holds locks with no active statement.
+
+    Two-signal test (COMMAND='Sleep' AND empty INFO) so KILL QUERY — which only
+    cancels a running statement — is escalated to KILL. See docs/adr/0002.
+    """
+    return identity["command"] == "Sleep" and not identity["info"]
+
+
 def kill_blocker(
     db: DatabaseConnection,
-    identity: dict[str, Any],
     blocker: dict[str, Any],
     cfg: Config,
-    poll_state: dict[str, Any],
 ) -> tuple[bool, str]:
-    """Execute KILL QUERY with safety checks.
+    """Resolve a fresh identity then kill the blocker with safety checks.
 
-    Returns (success, outcome_msg).
+    Returns (success, outcome). Idle-in-trx blockers escalate from KILL QUERY to
+    KILL (connection); active blockers keep KILL QUERY (see docs/adr/0002).
     """
-    # Check age >= threshold (N polls elapsed since phase two)
-    if poll_state.get("n_elapsed", 0) < poll_state.get("age_threshold", 0):
-        return False, "age_below_threshold"
+    identity = resolve_blocker_identity(db, blocker["thread_id"])
+    # Unresolvable identity is fail-safe excluded: never kill what we cannot vet.
+    if identity is None:
+        return False, "excluded_unresolved"
 
-    # Check allowlist using identity from phase_two
     if _matches_exclusion(identity["user"], identity["host"], cfg.kill_exclusion):
         return False, "excluded"
 
-    # Check monitor identity
     if identity["user"] == cfg.monitor_user and identity["host"] == cfg.monitor_host:
         return False, "is_monitor_self"
 
+    tid = identity["thread_id"]
+    sql, outcome = ("KILL %s", "killed_connection") if _is_idle(identity) else ("KILL QUERY %s", "killed_query")
     try:
-        db.query("KILL QUERY %s", (identity["thread_id"],))
-        log.info("KILL QUERY sent to thread %d (%s@%s)", identity["thread_id"], identity["user"], identity["host"])
-        return True, "kill_sent"
+        db.query(sql, (tid,))
+        log.info("%s -> thread %d (%s@%s)", outcome, tid, identity["user"], identity["host"])
+        return True, outcome
     except Exception as exc:
-        log.error("KILL QUERY failed for thread %d: %s", identity["thread_id"], exc)
+        log.error("kill failed for thread %d: %s", tid, exc)
         return False, f"kill_failed: {exc}"

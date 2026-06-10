@@ -7,7 +7,7 @@ import time
 from collections.abc import Callable
 
 from .config import Config
-from .counters import KCounter, NCounter
+from .counters import KCounter, MCounter, NCounter
 from .db import DatabaseConnection, DatabaseError
 from .durable_log import DurableLog
 from .poll import PollResult, run_poll
@@ -23,6 +23,7 @@ def schedule_polls(
     k_counter: KCounter,
     bottleneck_state: StateToggle,
     durable: DurableLog,
+    m_counter: MCounter,
     on_result: Callable[[PollResult], None] | None = None,
 ) -> None:
     """Fixed-delay poll scheduler loop with auto-reconnect. Never returns under normal operation."""
@@ -33,7 +34,7 @@ def schedule_polls(
     while True:
         t0 = time.monotonic()
         try:
-            result = run_poll(db, cfg, n_counter, k_counter, bottleneck_state)
+            result = run_poll(db, cfg, n_counter, k_counter, bottleneck_state, m_counter)
             reconnect_count = 0  # Reset on success
             if on_result:
                 on_result(result)

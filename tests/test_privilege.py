@@ -37,11 +37,21 @@ class TestCheckPrivilege:
 class TestResolveBlockerIdentity:
     def test_found(self) -> None:
         db = MagicMock()
-        db.query.return_value = [(123, "user1", "host1:3307", "mydb")]
+        db.query.return_value = [(123, "user1", "host1:3307", "mydb", "Query", "SELECT 1")]
         result = resolve_blocker_identity(db, 123)
         assert result is not None
         assert result["thread_id"] == 123
         assert result["host"] == "host1"
+        assert result["command"] == "Query"
+        assert result["info"] == "SELECT 1"
+
+    def test_idle_null_info(self) -> None:
+        db = MagicMock()
+        db.query.return_value = [(123, "user1", "host1:3307", "mydb", "Sleep", None)]
+        result = resolve_blocker_identity(db, 123)
+        assert result is not None
+        assert result["command"] == "Sleep"
+        assert result["info"] == ""
 
     def test_not_found(self) -> None:
         db = MagicMock()

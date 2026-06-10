@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .config import Config
-from .counters import KCounter, NCounter, evaluate_hysteresis
+from .counters import KCounter, MCounter, NCounter, evaluate_hysteresis
 from .db import DatabaseConnection
 from .state import StateToggle
 
@@ -214,7 +214,11 @@ def run_poll(
     n_counter: NCounter,
     k_counter: KCounter,
     bottleneck_state: StateToggle,
+    m_counter: MCounter,
 ) -> PollResult:
+    # M is temporal — it ticks every wall-clock poll, even when blind, so it must
+    # advance before phase_one (which may go blind or raise). See Heal Cooldown.
+    m_counter.tick()
     tr = phase_one(db)
     if tr is None:
         k_counter.increment()

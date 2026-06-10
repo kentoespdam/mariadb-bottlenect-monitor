@@ -75,8 +75,9 @@ with the others. **Phase one is the gate.** The sequence is:
 5. **If above entry → run phase two (attribution)**, the lock-wait-chain query.
 6. **If attribution fails → [[attribution-blindness]]:** `J++`, no target, no kill.
 7. **If attribution succeeds and** N is satisfied **and** M has elapsed **and** a
-   non-[[kill-exclusion|excluded]] root exists → **issue the single `KILL QUERY`** (then
-   start M). At most one kill is *sent* per poll.
+   non-[[kill-exclusion|excluded]] root exists → **issue the single kill** (`KILL QUERY` for
+   an active root, `KILL` for an idle-in-trx root — see [[auto-heal]]), then start M. At most
+   one kill is *sent* per poll.
 8. **Write the audit/alert** dictated by any state transition this poll.
 
 The load-bearing point is step 2 versus the rest: the **temporal** counter M is ticked by
@@ -218,24 +219,19 @@ least likely to clear on its own and most likely to be genuinely stuck. Note thi
 discipline of [[auto-heal]].
 
 ### Auto-Heal
-The act of cancelling the Blocker's running query to relieve a Bottleneck —
-specifically `KILL QUERY` (abort the statement, keep the connection alive), not a
-full `KILL CONNECTION`. Cancelling the statement rolls back its transaction and
-releases the lock, which is what frees the Bottleneck. Auto-Heal is opt-in and
-defaults to OFF; by default the system is alert-only. Known blind spot: an *idle*
-transaction holding a lock with no active statement has no query to cancel, so
-`KILL QUERY` cannot release it — this case is accepted for V1 because the dominant
-scenario is one heavy running query holding the lock, not an idle-in-transaction
-session. When attribution does name an idle root, it gets **no special handling**: the
-`KILL QUERY` is sent, the server accepts it syntactically, and — exactly as with any
-kill — the poll loop, never the return code, decides whether it worked. An impotent
-kill against an idle transaction is indistinguishable at the return-code layer from a
-kill whose effect is merely slow to drain; both surface only as "the Bottleneck is
-still here next poll." It therefore falls through the existing path: [[heal-cooldown]]
-withholds the next attempt, and if the Bottleneck outlasts the cooldown it is already
-in the "beyond healing capability, left for the operator" state that is locked
-elsewhere. The idle-transaction blind spot is thus not a new signal or state — it is one
-*instance* of "a kill may have no effect, and the poll loop is the verifier."
+The act of killing the Blocker to relieve a Bottleneck, **escalated by the Blocker's
+liveness** (see [ADR 0002](docs/adr/0002-targeted-kill-escalation-idle-blockers.md)): an
+*active* Blocker (a running statement) is cancelled with `KILL QUERY` (abort the statement,
+keep the connection alive); an *idle-in-transaction* Blocker — one holding a lock with no
+running statement — is severed with `KILL` (drop the connection), because it has no query to
+cancel. Either way the Blocker's transaction rolls back and releases the lock, which is what
+frees the Bottleneck. Liveness is read from a single fresh snapshot taken immediately before
+the kill, the same read that performs [[blocker-identity-resolution]]. Auto-Heal is opt-in
+and defaults to OFF; by default the system is alert-only. Whichever kill is sent, the poll
+loop — never the return code — decides whether it worked: a kill whose effect is slow to
+drain and one that did nothing both surface only as "the Bottleneck is still here next poll,"
+so [[heal-cooldown]] withholds the next attempt, and a Bottleneck that outlasts the cooldown
+is in the "beyond healing capability, left for the operator" state locked elsewhere.
 
 Auto-Heal issues **exactly one kill per poll** — it cancels the single chosen
 [[blocker]] (the deepest root, tie-broken by waiter count), then *stops and lets the
@@ -1028,8 +1024,9 @@ in V1 code vs. aspirational/planned.
   with freeze/unfreeze for observational counters (counters.py)
 - **Hysteresis state toggle** — entry/exit thresholds, StateToggle edge-triggered
   boolean with freeze (state.py)
-- **Auto-Heal (KILL QUERY)** — opt-in, one kill per poll, allowlist exclusion,
-  monitor-self exclusion (auto_heal.py)
+- **Auto-Heal (targeted KILL escalation)** — opt-in, one kill per poll, `KILL QUERY` for
+  active / `KILL` for idle-in-trx blockers, allowlist + monitor-self exclusion on a fresh
+  resolved identity (auto_heal.py; see ADR 0002)
 - **Startup config validation** — three-tier: absent patience→default, absent
   detection→refuse, malformed→refuse, `exit < entry` coherence, counter floors
   (config.py, _env.py)
@@ -1050,21 +1047,10 @@ in V1 code vs. aspirational/planned.
 
 ### V1 Behavioral Divergences
 
-V1 code implements simplified versions of M and N counters that differ from canonical
-architecture but work effectively in practice:
-
-#### M: Per-Blocker Age vs Global Cooldown
-
-**Canonical:** After ANY kill, wait M polls before allowing ANY next kill (global cooldown).
-
-**V1 code:** Track age per blocker thread_id. Each blocker accumulates independently —
-blocker A at M polls gets killed, blocker B at M polls gets killed immediately after.
-
-**Impact:** Can kill multiple different blockers rapidly in sequence if they all age
-past M simultaneously.
-
-**Why V1 works:** Different thread_id usually means different root cause. Killing blocker A
-doesn't affect blocker B's legitimacy. Global cooldown would delay legitimate kills.
+V1 code implements a simplified version of the N counter that differs from canonical
+architecture but works effectively in practice. (The earlier per-blocker M divergence was
+removed when Auto-Heal adopted the canonical global [[heal-cooldown]] — see
+[ADR 0002](docs/adr/0002-targeted-kill-escalation-idle-blockers.md).)
 
 #### N: Accumulation Above Entry vs Above Exit
 
@@ -1080,12 +1066,11 @@ consecutive polls).
 
 #### Design Rationale
 
-Both divergences trade canonical precision for operational simplicity:
-- **M per-blocker:** Simpler tracking, no global state coordination, effective when different blockers = different causes
+This divergence trades canonical precision for operational simplicity:
 - **N conservative:** Reduces false positives from boundary noise at cost of slightly delayed first intervention
 
-Operational evidence (no wrong-kills, effective bottleneck resolution) validates these
-tradeoffs for V1.
+Operational evidence (no wrong-kills, effective bottleneck resolution) validates this
+tradeoff for V1.
 
 ### Planned / Not Yet Implemented
 

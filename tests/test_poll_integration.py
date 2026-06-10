@@ -2,7 +2,7 @@
 
 from unittest.mock import MagicMock
 
-from src.counters import KCounter, NCounter
+from src.counters import KCounter, MCounter, NCounter
 from src.poll import run_poll
 from src.state import StateToggle
 
@@ -31,7 +31,7 @@ class TestPollIntegration:
         n = NCounter(cfg.N)
         k = KCounter(cfg.K)
         s = StateToggle("bottleneck")
-        result = run_poll(db, cfg, n, k, s)
+        result = run_poll(db, cfg, n, k, s, MCounter(cfg.M))
         assert result.phase_one_ok
         assert result.threads_running == 50
         assert n.value == 1
@@ -48,7 +48,7 @@ class TestPollIntegration:
         k = KCounter(cfg.K)
         s = StateToggle("bottleneck")
         s.set(True)
-        result = run_poll(db, cfg, n, k, s)
+        result = run_poll(db, cfg, n, k, s, MCounter(cfg.M))
         assert result.phase_one_ok
         assert result.threads_running == 10
         assert n.value == 0
@@ -64,7 +64,7 @@ class TestPollIntegration:
         k = KCounter(cfg.K)
         s = StateToggle("bottleneck")
         s.set(True)
-        result = run_poll(db, cfg, n, k, s)
+        result = run_poll(db, cfg, n, k, s, MCounter(cfg.M))
         assert result.phase_one_ok
         assert n.value == 2
         assert s.is_set is True
@@ -78,7 +78,7 @@ class TestPollIntegration:
         k = KCounter(cfg.K)
         s = StateToggle("bottleneck")
         s.set(True)
-        result = run_poll(db, cfg, n, k, s)
+        result = run_poll(db, cfg, n, k, s, MCounter(cfg.M))
         assert not result.phase_one_ok
         assert n.value == 1
         assert k.value == 1
@@ -91,7 +91,7 @@ class TestPollIntegration:
         n = NCounter(cfg.N)
         k = KCounter(cfg.K)
         s = StateToggle("bottleneck")
-        result = run_poll(db, cfg, n, k, s)
+        result = run_poll(db, cfg, n, k, s, MCounter(cfg.M))
         assert result.phase_one_ok
         assert result.phase_two_ok is True
         assert result.blocker is not None
@@ -103,7 +103,15 @@ class TestPollIntegration:
         n = NCounter(cfg.N)
         k = KCounter(cfg.K)
         s = StateToggle("bottleneck")
-        result = run_poll(db, cfg, n, k, s)
+        result = run_poll(db, cfg, n, k, s, MCounter(cfg.M))
         assert result.phase_one_ok
         assert result.phase_two_ok is None
         assert result.blocker is None
+
+    def test_m_ticks_even_when_blind(self) -> None:
+        # M is temporal: it must advance on a blind poll too (Heal Cooldown).
+        cfg = FakeConfig()
+        m = MCounter(cfg.M)
+        run_poll(self._make_db(50), cfg, NCounter(cfg.N), KCounter(cfg.K), StateToggle("b"), m)
+        run_poll(self._make_db(None), cfg, NCounter(cfg.N), KCounter(cfg.K), StateToggle("b"), m)
+        assert m.value == 2
