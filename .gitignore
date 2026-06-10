@@ -1,6 +1,7 @@
 # Virtual environment & env files
 .venv
 .env
+.env.example
 
 # Python build artifacts
 __pycache__/
