@@ -31,6 +31,8 @@ class TelegramAlert:
 
     def _format_message(self, alert_type: str, data: dict[str, Any]) -> str:
         label = alert_type.upper().replace("_", " ")
+        if "text" in data:
+            return str(data["text"])
         parts = [f"🔔 {label}"]
         if "threads_running" in data:
             parts.append(f"📊 Threads: {data['threads_running']}")
