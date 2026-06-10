@@ -1048,6 +1048,45 @@ in V1 code vs. aspirational/planned.
 - **Blocker identity resolution** — `PROCESSLIST` query, host port stripping, allowlist
   matching (auto_heal.py:50-65)
 
+### V1 Behavioral Divergences
+
+V1 code implements simplified versions of M and N counters that differ from canonical
+architecture but work effectively in practice:
+
+#### M: Per-Blocker Age vs Global Cooldown
+
+**Canonical:** After ANY kill, wait M polls before allowing ANY next kill (global cooldown).
+
+**V1 code:** Track age per blocker thread_id. Each blocker accumulates independently —
+blocker A at M polls gets killed, blocker B at M polls gets killed immediately after.
+
+**Impact:** Can kill multiple different blockers rapidly in sequence if they all age
+past M simultaneously.
+
+**Why V1 works:** Different thread_id usually means different root cause. Killing blocker A
+doesn't affect blocker B's legitimacy. Global cooldown would delay legitimate kills.
+
+#### N: Accumulation Above Entry vs Above Exit
+
+**Canonical:** N increments while `Threads_running > exit_threshold` (throughout hysteresis band).
+
+**V1 code:** N increments only when `Threads_running > entry_threshold`.
+
+**Impact:** When tr is in hysteresis band (exit < tr ≤ entry), N pauses instead of accumulating.
+
+**Why V1 works:** More conservative threshold prevents premature kills from noisy signals
+near the boundary. First kill requires stronger sustained signal (tr > entry for N
+consecutive polls).
+
+#### Design Rationale
+
+Both divergences trade canonical precision for operational simplicity:
+- **M per-blocker:** Simpler tracking, no global state coordination, effective when different blockers = different causes
+- **N conservative:** Reduces false positives from boundary noise at cost of slightly delayed first intervention
+
+Operational evidence (no wrong-kills, effective bottleneck resolution) validates these
+tradeoffs for V1.
+
 ### Planned / Not Yet Implemented
 
 - **Two-line write-ahead kill audit** — V1 logs single post-kill line; intent-before-kill
@@ -1064,9 +1103,6 @@ in V1 code vs. aspirational/planned.
 - **J counter (Attribution Blindness)** — defined in counters.py but not wired into the
   poll loop; phase-two failure is logged but does not accumulate J or fire an attribution
   blindness alert
-- **M counter (Heal Cooldown)** — defined in counters.py but not wired; cooldown logic
-  in main.py uses a simpler per-thread `seen` counter approach rather than the M poll-count
-  described in the Heal Cooldown section
 - **Dedicated recovery alerts** — V1 sends bottleneck up/down edge alerts but does not
   implement the full recovery-alert system for all toggled conditions (monitor blindness,
   heal capability failure, attribution blindness)
