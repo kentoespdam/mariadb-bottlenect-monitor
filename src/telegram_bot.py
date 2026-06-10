@@ -1,13 +1,12 @@
 """Telegram bot — polls getUpdates and dispatches /commands."""
-
 from __future__ import annotations
 
+import json
 import logging
 import threading
 from typing import Any
 
 import httpx
-
 from . import bot_commands as cmd
 from .config import Config
 from .db import DatabaseConnection
@@ -15,6 +14,12 @@ from .telegram_alert import _API_BASE
 
 log = logging.getLogger(__name__)
 
+COMMANDS = [
+    {"command": "status", "description": "Laporan kesehatan server"},
+    {"command": "threads", "description": "Status threads MariaDB"},
+    {"command": "processlist", "description": "Query aktif (top 10)"},
+    {"command": "config", "description": "Konfigurasi monitor"},
+    {"command": "help", "description": "Bantuan commands"}]
 
 class TelegramBot:
     def __init__(self, cfg: Config, db: DatabaseConnection) -> None:
@@ -26,9 +31,18 @@ class TelegramBot:
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
+        self._register_commands()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
         log.info("Telegram bot started")
+
+    def _register_commands(self) -> None:
+        try:
+            with httpx.Client(timeout=10) as c:
+                c.post(f"{_API_BASE}{self._token}/setMyCommands",
+                       json={"commands": COMMANDS})
+        except Exception:
+            log.debug("setMyCommands error", exc_info=True)
 
     def stop(self) -> None:
         self._stop.set()
@@ -63,7 +77,21 @@ class TelegramBot:
                 self._dispatch(text.split()[0].lower(), str(chat_id))
         return new_offset
 
+    def _send_menu_keyboard(self, chat_id: str) -> None:
+        kb = [["/status", "/threads"], ["/processlist", "/config"], ["/help"]]
+        rm = json.dumps({"keyboard": kb, "resize_keyboard": True, "one_time_keyboard": False})
+        try:
+            with httpx.Client(timeout=10) as c:
+                c.post(f"{_API_BASE}{self._token}/sendMessage",
+                       json={"chat_id": chat_id, "text": "Pilih command:", "reply_markup": rm})
+        except Exception:
+            log.debug("Menu keyboard error", exc_info=True)
+
     def _dispatch(self, command: str, chat_id: str) -> None:
+        if command == "/start":
+            self._send_reply(chat_id, "🤖 MariaDB Monitor\nKetik /help untuk bantuan")
+            self._send_menu_keyboard(chat_id)
+            return
         handlers = {
             "/status": lambda: cmd.cmd_status(self._db),
             "/threads": lambda: cmd.cmd_threads(self._db),
@@ -79,6 +107,7 @@ class TelegramBot:
         except Exception:
             log.debug("Command %s failed", command, exc_info=True)
             self._send_reply(chat_id, "Error processing command")
+        self._send_menu_keyboard(chat_id)
 
     def _send_reply(self, chat_id: str, text: str) -> None:
         url = f"{_API_BASE}{self._token}/sendMessage"
